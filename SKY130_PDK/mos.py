@@ -7,9 +7,136 @@ import collections
 import logging
 logger = logging.getLogger(__name__)
 
+# sky130 poly (66/20) minimum drawn width, in nm. A drawn gate shorter than
+# this is not manufacturable, so it is rejected rather than silently widened.
+SKY130_POLY_MIN_WIDTH = 150
+# sky130 layout grid, in nm. Drawn channel lengths must land on it.
+SKY130_GRID = 5
+
+
+def _extract_channel_length(primitive_parameters):
+    """Return the drawn channel length in nm from the netlist parameters, or
+    None when no length was supplied.
+
+    ``primitive_parameters`` is the per-device dict that
+    ``align.primitive.main.generate_MOS_primitive`` already forwards to this
+    generator (``primitive_parameters=parameters``). It looks like::
+
+        {'M1': {'W': '1.05E-06', 'L': '1.5E-07', ...},
+         'M2': {...},
+         'model': 'NMOS'}
+
+    so the string-valued 'model' entry has to be skipped.
+    """
+    if not primitive_parameters:
+        return None
+
+    lengths = set()
+    for key, values in primitive_parameters.items():
+        if not isinstance(values, dict):
+            continue                      # 'model': 'NMOS'
+        if 'L' not in values:
+            continue
+        lengths.add(float(values['L']))
+
+    if not lengths:
+        return None
+
+    assert len(lengths) == 1, \
+        f"All devices in a MOS primitive must share one channel length; got {sorted(lengths)}"
+
+    length_m = lengths.pop()
+    length_nm = length_m * 1e9
+    length_rounded = int(round(length_nm))
+    assert abs(length_nm - length_rounded) < 1e-6, \
+        f"Channel length {length_m} m does not resolve to an integer nm value"
+    return length_rounded
+
+
+def _retune_poly_grid(pdk, length_nm):
+    """Rebuild the vertical (column) grid so the drawn gate length equals
+    ``length_nm`` instead of the fixed ``pdk['Poly']['Width']``.
+
+    Poly, M1 and M3 are all vertical and all share ONE column index space in
+    this generator: ``_addMOS`` draws the gate on poly track ``i`` and the
+    flanking source/drain contacts on M1 track ``i +/- n``, and ``_connectNets``
+    places cell pins on M3 using the same indices. They therefore have to stay
+    at a common pitch, which in the stock PDK is 430 nm for all three.
+
+    The widened pitch MUST stay an integer multiple of the nominal pitch. A
+    primitive's width is ``gatesPerUnitCell * x_cells * polyPitch``, and the
+    top-level placer and router read the unmodified layers.json, so they still
+    legalise cells on the nominal 430 nm column grid. Choosing an arbitrary
+    pitch (e.g. 430+delta) makes the cell width a non-multiple of 430, the
+    placer cannot legalise it, and the ILP spins forever -- measured: every
+    L != 150 stalled in "PnR.placer.SeqPair Enumerated search" until killed.
+    Quantising to k*430 keeps the cell-internal tracks a strict SUBSET of the
+    router's tracks, so the two grids can never disagree.
+
+    Within that constraint the gate is widened and the poly-to-poly space is
+    whatever is left over, which is always >= the nominal 280 nm space.
+
+    The pdk object is loaded fresh for every primitive in
+    ``generate_MOS_primitive``, so mutating it here cannot leak into any other
+    cell.
+    """
+    base_width = pdk['Poly']['Width']
+    base_pitch = pdk['Poly']['Pitch']
+    min_space = base_pitch - base_width          # 280 nm nominal poly-poly space
+
+    if length_nm == base_width:
+        return 1                          # nominal device: leave the PDK untouched
+
+    assert length_nm >= SKY130_POLY_MIN_WIDTH, \
+        (f"Requested channel length L={length_nm}nm is below the sky130 poly "
+         f"minimum width of {SKY130_POLY_MIN_WIDTH}nm")
+    assert length_nm % SKY130_GRID == 0, \
+        (f"Requested channel length L={length_nm}nm is off the {SKY130_GRID}nm "
+         f"sky130 layout grid")
+
+    # Smallest integer multiple of the nominal pitch that still leaves the
+    # nominal poly-to-poly space beside a gate of this length.
+    k = -(-(length_nm + min_space) // base_pitch)     # ceil division
+    new_pitch = k * base_pitch
+
+    pdk['Poly']['Width'] = length_nm
+    pdk['Poly']['Pitch'] = new_pitch
+    # Centre the gate between two M1 tracks, exactly as offset 215 does at k=1.
+    pdk['Poly']['Offset'] = new_pitch // 2
+
+    # M1 and M3 share the poly column index space; move them to the same pitch
+    # so source/drain contacts keep landing between gates. Their widths are
+    # unchanged, so their spacing only ever relaxes.
+    for layer in ('M1', 'M3'):
+        if layer in pdk:
+            pdk[layer]['Pitch'] = new_pitch
+
+    logger.info(
+        f"Channel length L={length_nm}nm honoured: poly width "
+        f"{base_width}->{length_nm}nm, column pitch {base_pitch}->{new_pitch}nm "
+        f"(k={k}, poly-poly space {new_pitch - length_nm}nm)")
+    return k
+
+
 class MOSGenerator(DefaultCanvas):
 
     def __init__(self, pdk, height, fin, gate, gateDummy, shared_diff, stack, bodyswitch, **kwargs):
+        # Honour the netlist channel length BEFORE the base canvas builds its
+        # metal generators from the pdk, otherwise M1/M3 would be created on the
+        # stale pitch.
+        length_nm = _extract_channel_length(kwargs.get('primitive_parameters'))
+        self.channelLength = length_nm if length_nm is not None else pdk['Poly']['Width']
+        # Reference half-pitch used by the diffusion / gate-strap enclosure
+        # grids below. It must stay pinned to the NOMINAL pitch even when the
+        # poly pitch is widened for a long channel: those stoppoints control
+        # how far the shared source/drain diffusion reaches towards the cell
+        # boundary, and a shared-diffusion device needs that diffusion to stay
+        # CONTINUOUS across the boundary. Letting it track the widened pitch
+        # tears the strip apart -- measured: at k=2 the diffusion broke into
+        # 10 islands with 180nm gaps, violating difftap.3 (min 270nm) 45 times.
+        self.polyStopRef = pdk['Poly']['Pitch'] // 2
+        if length_nm is not None:
+            _retune_poly_grid(pdk, length_nm)
         super().__init__(pdk)
         self.finsPerUnitCell = height
         assert self.finsPerUnitCell % 4 == 0
@@ -51,7 +178,10 @@ class MOSGenerator(DefaultCanvas):
                                       spg=SingleGrid( offset=0, pitch=self.pdk['Poly']['Pitch'])))
 
         offset = self.gateDummy*self.pdk['Poly']['Pitch']+self.pdk['Poly']['Offset'] - self.pdk['Poly']['Pitch']//2
-        stoppoint = self.gateDummy*self.pdk['Poly']['Pitch'] + self.pdk['Poly']['Offset']-self.pdk['Active']['poly_enclosure']
+        # NOTE: polyStopRef (nominal half-pitch), not the widened Poly Offset.
+        # This keeps the shared source/drain diffusion continuous across the
+        # unit-cell boundary at every channel length; see __init__.
+        stoppoint = self.gateDummy*self.pdk['Poly']['Pitch'] + self.polyStopRef-self.pdk['Active']['poly_enclosure']
         self.active = self.addGen( Wire( 'active', 'Active', 'h',
                                          clg=UncoloredCenterLineGrid( pitch=self.activePitch, width=self.activeWidth, offset=self.activeOffset),
                                          spg=EnclosureGrid( pitch=self.unitCellLength, offset=offset*self.shared_diff, stoppoint=stoppoint-offset*self.shared_diff, check=True)))
