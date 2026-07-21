@@ -3,6 +3,7 @@ from align.cell_fabric.generators import *
 from align.cell_fabric.grid import *
 from math import floor
 import collections
+import json
 
 import logging
 logger = logging.getLogger(__name__)
@@ -51,6 +52,57 @@ def _extract_channel_length(primitive_parameters):
     assert abs(length_nm - length_rounded) < 1e-6, \
         f"Channel length {length_m} m does not resolve to an integer nm value"
     return length_rounded
+
+
+def _pdk_type(pdk):
+    """Return design_info['pdk_type'] from the layers.json this Pdk was loaded
+    from, or None if it cannot be determined.
+
+    ``Pdk.load`` only ingests the 'Abstraction' array, so design_info is not
+    reachable through ``pdk[...]``; the resolved path is, via ``pdk.layerfile``.
+    """
+    layerfile = getattr(pdk, 'layerfile', None)
+    if layerfile is None:
+        return None
+    try:
+        with open(layerfile, 'rt') as fp:
+            return json.load(fp).get('design_info', {}).get('pdk_type')
+    except (OSError, ValueError):
+        return None
+
+
+def _extract_drawn_width(primitive_parameters):
+    """Return the drawn transistor width in nm from the netlist parameters, or
+    None when no width was supplied.
+
+    Same source and same shape as ``_extract_channel_length``: the per-device
+    dict that ``align.primitive.main.generate_MOS_primitive`` forwards as
+    ``primitive_parameters``, whose string-valued 'model' entry has to be
+    skipped.
+    """
+    if not primitive_parameters:
+        return None
+
+    widths = set()
+    for key, values in primitive_parameters.items():
+        if not isinstance(values, dict):
+            continue                      # 'model': 'NMOS'
+        if 'W' not in values:
+            continue
+        widths.add(float(values['W']))
+
+    if not widths:
+        return None
+
+    assert len(widths) == 1, \
+        f"All devices in a MOS primitive must share one width; got {sorted(widths)}"
+
+    width_m = widths.pop()
+    width_nm = width_m * 1e9
+    width_rounded = int(round(width_nm))
+    assert abs(width_nm - width_rounded) < 1e-6, \
+        f"Width {width_m} m does not resolve to an integer nm value"
+    return width_rounded
 
 
 def _retune_poly_grid(pdk, length_nm):
@@ -135,6 +187,16 @@ class MOSGenerator(DefaultCanvas):
         # tears the strip apart -- measured: at k=2 the diffusion broke into
         # 10 islands with 180nm gaps, violating difftap.3 (min 270nm) 45 times.
         self.polyStopRef = pdk['Poly']['Pitch'] // 2
+        # On a planar BULK process W is a drawn diffusion width, not a fin
+        # count. gen_param.py has already validated it against this PDK's real
+        # bounds; here it simply replaces Fin['Pitch']*fin as the drawn width of
+        # the source/drain strip. `fin` stays what it has become: the number of
+        # 210nm rows of the vertical grid this device is allocated, which is
+        # what the dummy-fin headroom check below is really measuring. On a
+        # genuine fin process W IS a fin count, so this stays off.
+        self.drawnWidth = None
+        if _pdk_type(pdk) == 'Bulk':
+            self.drawnWidth = _extract_drawn_width(kwargs.get('primitive_parameters'))
         if length_nm is not None:
             _retune_poly_grid(pdk, length_nm)
         super().__init__(pdk)
@@ -156,7 +218,14 @@ class MOSGenerator(DefaultCanvas):
         assert gateDummy > 0
         self.unitCellLength = self.gatesPerUnitCell* self.pdk['Poly']['Pitch']
         self.activeOffset = self.unitCellHeight//2 -self.pdk['Fin']['Pitch']//2
-        self.activeWidth =  self.pdk['Fin']['Pitch']*fin
+        # Draw the requested width, falling back to the fin-quantised width when
+        # no W reached us (FinFET PDKs, or a caller that supplied no parameters).
+        # For a W that is a multiple of the fin pitch the two are identical, so
+        # every device that built before this change is drawn byte-identically.
+        self.activeWidth = self.drawnWidth if self.drawnWidth is not None \
+            else self.pdk['Fin']['Pitch']*fin
+        assert self.activeWidth <= self.pdk['Fin']['Pitch']*fin, \
+            f"drawn width {self.activeWidth}nm exceeds its {fin}-row allocation"
         self.activePitch = self.unitCellHeight
         self.RVTWidth = self.activeWidth + 2*self.pdk['Active']['active_enclosure']
  
